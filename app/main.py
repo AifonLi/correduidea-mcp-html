@@ -1,29 +1,32 @@
-from starlette.applications import Starlette
-from starlette.routing import Mount, Route
 from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 import httpx, os, re, xml.etree.ElementTree as ET
 
+# ---------------------------------------------------------------------------
+# MCP server en modo HTTP sin estado (evita el error de Task group)
+# ---------------------------------------------------------------------------
 mcp = FastMCP("Correduidea MCP (HTML)", stateless_http=True)
 
 ALLOWED_DOMAIN = "correduidea.com"
 SITEMAP_URL = "https://www.correduidea.com/sitemap.xml"
 ALLOWLIST_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "allowlist_urls.txt")
 
+# ------------------------------ Utilidades ----------------------------------
 def _allowed(url: str) -> bool:
     p = urlparse(url)
     return p.scheme in ("http", "https") and p.netloc.endswith(ALLOWED_DOMAIN)
 
 def _extract_visible_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")  # sin lxml (más compatible)
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return re.sub(r"\s+", " ", soup.get_text(separator=" ", strip=True))
 
 def _read_allowlist() -> list[str]:
-    urls = []
+    urls: list[str] = []
     try:
         with open(ALLOWLIST_FILE, "r", encoding="utf-8") as f:
             for line in f:
@@ -35,7 +38,7 @@ def _read_allowlist() -> list[str]:
     return urls
 
 async def _read_sitemap() -> list[str]:
-    urls = []
+    urls: list[str] = []
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get(SITEMAP_URL)
@@ -59,7 +62,7 @@ async def _get_urls_combined() -> list[str]:
     allow = _read_allowlist()
     return (site + [u for u in allow if u not in site])[:200]
 
-# -------- TOOLS --------
+# -------------------------------- TOOLS -------------------------------------
 @mcp.tool()
 async def ping() -> str:
     return "pong"
@@ -105,7 +108,7 @@ async def buscar_texto(query: str, max_pages: int = 10) -> list[dict]:
                 out.append({"url": u, "encontrado": False, "fragmento": f"Error: {e}"})
     return out
 
-# -------- RUTAS HTTP --------
+# ------------------------- App HTTP (GET/HEAD/OPTIONS) -----------------------
 def _cors_headers():
     return {
         "Access-Control-Allow-Origin": "*",
@@ -114,14 +117,14 @@ def _cors_headers():
     }
 
 async def mcp_health(request):
-    # 200 para GET/HEAD
     return PlainTextResponse("MCP server OK", headers=_cors_headers())
 
 async def mcp_options(request):
-    # 204 para OPTIONS (preflight)
     return Response(status_code=204, headers=_cors_headers())
 
-inner_app = mcp.streamable_http_app()  # maneja POST /mcp
-app = Starlette(routes=[
-    Route("/mcp", mcp_options, methods=["OPTIONS"]),
-    Route("/mcp", mcp_health, m_
+# ⚠️ App principal: el propio servidor MCP
+app = mcp.streamable_http_app()
+
+# Añadimos rutas GET/HEAD/OPTIONS al MISMO router (así se mantienen los eventos de startup)
+app.router.routes.insert(0, Route("/mcp", mcp_options, methods=["OPTIONS"]))
+app.router.routes.insert(0, Route("/mcp", mcp_health, methods=["GET", "HEAD"]))
