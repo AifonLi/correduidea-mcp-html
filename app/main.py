@@ -6,8 +6,9 @@ from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 import httpx, os, re, xml.etree.ElementTree as ET
 
-# -------------------------- MCP server (HTTP streamable) ---------------------
-mcp = FastMCP("Correduidea MCP (HTML)", stateless_http=True)
+# --- Servidor MCP ------------------------------------------------------------
+# Nota: sin parámetros raros para máxima compatibilidad
+mcp = FastMCP("Correduidea MCP (HTML)")
 
 ALLOWED_DOMAIN = "correduidea.com"
 SITEMAP_URL = "https://www.correduidea.com/sitemap.xml"
@@ -18,13 +19,13 @@ def _allowed(url: str) -> bool:
     return p.scheme in ("http", "https") and p.netloc.endswith(ALLOWED_DOMAIN)
 
 def _extract_visible_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")  # sin lxml (más compatible en Render)
+    soup = BeautifulSoup(html, "html.parser")  # evita dependencia de lxml
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return re.sub(r"\s+", " ", soup.get_text(separator=" ", strip=True))
 
 def _read_allowlist() -> list[str]:
-    urls: list[str] = []
+    urls = []
     try:
         with open(ALLOWLIST_FILE, "r", encoding="utf-8") as f:
             for line in f:
@@ -36,7 +37,7 @@ def _read_allowlist() -> list[str]:
     return urls
 
 async def _read_sitemap() -> list[str]:
-    urls: list[str] = []
+    urls = []
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get(SITEMAP_URL)
@@ -87,3 +88,31 @@ async def buscar_texto(query: str, max_pages: int = 10) -> list[dict]:
     if not q:
         return [{"error": "La query no puede estar vacía."}]
     urls = (await _get_urls_combined())[:max(1, max_pages)]
+    out = []
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for u in urls:
+            try:
+                r = await client.get(u)
+                if r.status_code != 200:
+                    out.append({"url": u, "encontrado": False, "fragmento": f"HTTP {r.status_code}"})
+                    continue
+                text = _extract_visible_text(r.text)
+                pos = text.lower().find(q)
+                if pos >= 0:
+                    start = max(0, pos - 120); end = min(len(text), pos + 120)
+                    out.append({"url": u, "encontrado": True, "fragmento": text[start:end]})
+                else:
+                    out.append({"url": u, "encontrado": False, "fragmento": ""})
+            except Exception as e:
+                out.append({"url": u, "encontrado": False, "fragmento": f"Error: {e}"})
+    return out
+
+# -------------------------- App HTTP (GET/HEAD/POST) -------------------------
+async def mcp_health(request):
+    return PlainTextResponse("MCP server OK")
+
+inner_app = mcp.streamable_http_app()  # maneja POST /mcp para ChatGPT
+app = Starlette(routes=[
+    Route("/mcp", mcp_health, methods=["GET", "HEAD"]),  # 200 OK para GET/HEAD
+    Mount("/", app=inner_app),                           # POST /mcp (MCP real)
+])
