@@ -1,0 +1,6 @@
+mcp
+starlette
+uvicorn
+httpx
+beautifulsoup4
+lxml
