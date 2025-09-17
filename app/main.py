@@ -1,13 +1,11 @@
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, Response
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 import httpx, os, re, xml.etree.ElementTree as ET
 
-# -------------------------- MCP server (HTTP streamable) ---------------------
-# ⚠️ IMPORTANTE: stateless_http=True evita el error de "Task group is not initialized"
 mcp = FastMCP("Correduidea MCP (HTML)", stateless_http=True)
 
 ALLOWED_DOMAIN = "correduidea.com"
@@ -19,13 +17,13 @@ def _allowed(url: str) -> bool:
     return p.scheme in ("http", "https") and p.netloc.endswith(ALLOWED_DOMAIN)
 
 def _extract_visible_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")  # sin lxml para máxima compatibilidad
+    soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return re.sub(r"\s+", " ", soup.get_text(separator=" ", strip=True))
 
 def _read_allowlist() -> list[str]:
-    urls: list[str] = []
+    urls = []
     try:
         with open(ALLOWLIST_FILE, "r", encoding="utf-8") as f:
             for line in f:
@@ -37,7 +35,7 @@ def _read_allowlist() -> list[str]:
     return urls
 
 async def _read_sitemap() -> list[str]:
-    urls: list[str] = []
+    urls = []
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get(SITEMAP_URL)
@@ -61,7 +59,7 @@ async def _get_urls_combined() -> list[str]:
     allow = _read_allowlist()
     return (site + [u for u in allow if u not in site])[:200]
 
-# --------------------------------- TOOLS -------------------------------------
+# -------- TOOLS --------
 @mcp.tool()
 async def ping() -> str:
     return "pong"
@@ -107,13 +105,23 @@ async def buscar_texto(query: str, max_pages: int = 10) -> list[dict]:
                 out.append({"url": u, "encontrado": False, "fragmento": f"Error: {e}"})
     return out
 
-# -------------------------- App HTTP (GET/HEAD/POST) -------------------------
-async def mcp_health(request):
-    # Respuesta simple para validaciones GET/HEAD
-    return PlainTextResponse("MCP server OK")
+# -------- RUTAS HTTP --------
+def _cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
 
-inner_app = mcp.streamable_http_app()  # maneja POST /mcp para ChatGPT
+async def mcp_health(request):
+    # 200 para GET/HEAD
+    return PlainTextResponse("MCP server OK", headers=_cors_headers())
+
+async def mcp_options(request):
+    # 204 para OPTIONS (preflight)
+    return Response(status_code=204, headers=_cors_headers())
+
+inner_app = mcp.streamable_http_app()  # maneja POST /mcp
 app = Starlette(routes=[
-    Route("/mcp", mcp_health, methods=["GET", "HEAD"]),  # 200 OK para GET/HEAD
-    Mount("/", app=inner_app),                           # POST /mcp (MCP real)
-])
+    Route("/mcp", mcp_options, methods=["OPTIONS"]),
+    Route("/mcp", mcp_health, m_
