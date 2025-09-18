@@ -1,26 +1,25 @@
+import os, re, json, xml.etree.ElementTree as ET
+from urllib.parse import urlparse
+import httpx
+from bs4 import BeautifulSoup
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
-import httpx, os, re, xml.etree.ElementTree as ET
 
-# ---------------------------------------------------------------------------
-# MCP server en modo HTTP sin estado (evita el error de Task group)
-# ---------------------------------------------------------------------------
+# ------------------ MCP server ------------------
 mcp = FastMCP("Correduidea MCP (HTML)", stateless_http=True)
 
-ALLOWED_DOMAIN = "correduidea.com"
+ALLOWED_DOMAIN = "correduidea.com"  # admite www.correduidea.com
 SITEMAP_URL = "https://www.correduidea.com/sitemap.xml"
 ALLOWLIST_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "allowlist_urls.txt")
 
-# ------------------------------ Utilidades ----------------------------------
+# ------------------ utils -----------------------
 def _allowed(url: str) -> bool:
     p = urlparse(url)
     return p.scheme in ("http", "https") and p.netloc.endswith(ALLOWED_DOMAIN)
 
 def _extract_visible_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")  # sin lxml (más compatible)
+    soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     return re.sub(r"\s+", " ", soup.get_text(separator=" ", strip=True))
@@ -51,6 +50,7 @@ async def _read_sitemap() -> list[str]:
                     urls.append(u)
     except Exception:
         pass
+    # dedup
     seen, out = set(), []
     for u in urls:
         if u not in seen:
@@ -62,7 +62,7 @@ async def _get_urls_combined() -> list[str]:
     allow = _read_allowlist()
     return (site + [u for u in allow if u not in site])[:200]
 
-# -------------------------------- TOOLS -------------------------------------
+# ------------------ tools existentes ------------------
 @mcp.tool()
 async def ping() -> str:
     return "pong"
@@ -108,7 +108,49 @@ async def buscar_texto(query: str, max_pages: int = 10) -> list[dict]:
                 out.append({"url": u, "encontrado": False, "fragmento": f"Error: {e}"})
     return out
 
-# ------------------------- App HTTP (GET/HEAD/OPTIONS) -----------------------
+# ------------------ tools estándar para la UI ------------------
+@mcp.tool(name="search")
+async def tool_search(query: str, max_results: int = 8) -> list[dict]:
+    """Devuelve resultados en el formato que espera ChatGPT."""
+    q = (query or "").strip().lower()
+    results = []
+    urls = await _get_urls_combined()
+
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for u in urls[:20]:
+            try:
+                r = await client.get(u)
+                if r.status_code != 200:
+                    continue
+                html = r.text
+                text = _extract_visible_text(html)
+                if q in text.lower() or q in u.lower():
+                    m = re.search(r"<title>(.*?)</title>", html, flags=re.I | re.S)
+                    title = (m.group(1).strip() if m else u)[:120]
+                    results.append({"id": u, "title": title, "url": u})
+                    if len(results) >= max_results:
+                        break
+            except Exception:
+                pass
+
+    return [{"type": "text", "text": json.dumps({"results": results}, ensure_ascii=False)}]
+
+@mcp.tool(name="fetch")
+async def tool_fetch(id: str) -> list[dict]:
+    """Recibe un id (usamos la URL) y devuelve texto de la página."""
+    url = id.strip()
+    if not _allowed(url):
+        return [{"type": "text", "text": json.dumps({"error": "URL no permitida"}, ensure_ascii=False)}]
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            text = _extract_visible_text(r.text)[:8000]
+            return [{"type": "text", "text": text}]
+    except Exception as e:
+        return [{"type": "text", "text": f"Error: {e}"}]
+
+# ------------------ HTTP (salud/CORS) ------------------
 def _cors_headers():
     return {
         "Access-Control-Allow-Origin": "*",
@@ -122,9 +164,8 @@ async def mcp_health(request):
 async def mcp_options(request):
     return Response(status_code=204, headers=_cors_headers())
 
-# ⚠️ App principal: el propio servidor MCP
+# App principal: el propio servidor MCP
 app = mcp.streamable_http_app()
-
-# Añadimos rutas GET/HEAD/OPTIONS al MISMO router (así se mantienen los eventos de startup)
+# GET/HEAD/OPTIONS sobre el mismo router (evita errores de startup)
 app.router.routes.insert(0, Route("/mcp", mcp_options, methods=["OPTIONS"]))
 app.router.routes.insert(0, Route("/mcp", mcp_health, methods=["GET", "HEAD"]))
